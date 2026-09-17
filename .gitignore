@@ -1,0 +1,15 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+data/silver/
+data/gold/
+data/quarantine/
+data/streaming/silver/
+data/streaming/quarantine/
+data/streaming/checkpoints/
+data/bronze/*.csv
+dashboard/*.pbix

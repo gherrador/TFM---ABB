@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+otlp:
+  promote_resource_attributes:
+    - kafka.cluster.id
+    - kafka.broker.id
+    - kafka.version
+    - host.hostname
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+rule_files:
+  - /mnt/config/trigger_rules-generated.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

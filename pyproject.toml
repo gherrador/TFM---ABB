@@ -1,0 +1,36 @@
+[project]
+name = "tfm"
+version = "0.1.0"
+description = "TFM de Ingeniería de Datos para eventos industriales de apriete"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "numpy>=2.0,<3.0",
+    "pandas>=2.2,<4.0",
+    "pyarrow>=17,<26",
+    "psycopg[binary]>=3.2,<4.0",
+    "python-dotenv>=1.0,<2.0",
+    "confluent-kafka[avro]>=2.6,<3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+]
+
+[tool.poetry]
+packages = [
+    { include = "config", from = "src" },
+    { include = "data_quality", from = "src" },    
+    { include = "iot", from = "src" },
+    { include = "metadata", from = "src" },
+    { include = "pipelines", from = "src" },
+    { include = "processing", from = "src" },
+    { include = "schemas", from = "src" },
+    { include = "serving", from = "src" },
+    { include = "transformation", from = "src" },    
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["test"]

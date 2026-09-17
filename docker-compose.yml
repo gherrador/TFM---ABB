@@ -1,0 +1,325 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tfm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tfm_tightening}
+      POSTGRES_USER: ${POSTGRES_USER:-tfm_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfm_password}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - tfm_postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-tfm_user} -d ${POSTGRES_DB:-tfm_tightening}",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  kafka:
+    image: confluentinc/cp-server:${CONFLUENT_PLATFORM_VERSION:-8.3.1}
+    container_name: tfm-kafka
+    hostname: kafka
+    restart: unless-stopped
+    ports:
+      - "${KAFKA_HOST_PORT:-9092}:9092"
+      - "${KAFKA_JMX_HOST_PORT:-9101}:9101"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:${KAFKA_HOST_PORT:-9092}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_CONFLUENT_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONFLUENT_METRICS_REPORTER_BOOTSTRAP_SERVERS: kafka:29092
+      CONFLUENT_METRICS_REPORTER_TOPIC_REPLICAS: 1
+      CONFLUENT_METRICS_ENABLE: "true"
+      CONFLUENT_SUPPORT_CUSTOMER_ID: anonymous
+
+      # Ruta de métricas de Control Center Next Gen (patrón oficial C3):
+      # broker TelemetryReporter -> OTLP/HTTP -> Prometheus -> Control Center.
+      KAFKA_METRIC_REPORTERS: io.confluent.telemetry.reporter.TelemetryReporter
+      KAFKA_CONFLUENT_TELEMETRY_METRICS_COLLECTOR_INTERVAL_MS: "15000"
+      KAFKA_CONFLUENT_CONSUMER_LAG_EMITTER_ENABLED: "true"
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+
+    # El /etc/confluent/docker/run por defecto de Confluent ejecuta
+    # configure -> ensure -> launch. Se mantiene esa misma secuencia, insertando
+    # un paso adicional después de configure para que los nombres literales `._c3` sean
+    # escritos directamente en kafka.properties sin traducción de nombres de variables de entorno de Docker.
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        /etc/confluent/docker/configure
+        /opt/tfm-kafka/inject-telemetry.sh
+        /etc/confluent/docker/ensure
+        exec /etc/confluent/docker/launch
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    volumes:
+      - tfm_kafka_data:/var/lib/kafka/data
+      - ./docker/kafka/telemetry.properties:/opt/tfm-kafka/telemetry.properties:ro
+      - ./docker/kafka/inject-telemetry.sh:/opt/tfm-kafka/inject-telemetry.sh:ro
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:${CONFLUENT_PLATFORM_VERSION:-8.3.1}
+    container_name: tfm-schema-registry
+    hostname: schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${SCHEMA_REGISTRY_HOST_PORT:-8081}:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:29092
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "bash -c '</dev/tcp/localhost/8081'"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  kafka-init:
+    image: confluentinc/cp-server:${CONFLUENT_PLATFORM_VERSION:-8.3.1}
+    container_name: tfm-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "kafka-topics --bootstrap-server kafka:29092
+      --create --if-not-exists
+      --topic ${KAFKA_RAW_TOPIC:-torque-events-raw}
+      --partitions ${KAFKA_RAW_TOPIC_PARTITIONS:-3}
+      --replication-factor 1
+      && kafka-topics --bootstrap-server kafka:29092 --describe
+      --topic ${KAFKA_RAW_TOPIC:-torque-events-raw}"
+    restart: "no"
+
+
+  spark:
+    image: apache/spark:3.5.9-scala2.12-java17-python3-r-ubuntu
+    container_name: tfm-spark
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    working_dir: /opt/project
+    user: "0:0"
+    volumes:
+      - ./:/opt/project
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-tfm_tightening}
+      POSTGRES_USER: ${POSTGRES_USER:-tfm_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfm_password}
+      POSTGRES_SCHEMA: analytics
+
+    command:
+      - /opt/spark/bin/spark-submit
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9,org.apache.spark:spark-avro_2.12:3.5.9,org.postgresql:postgresql:42.7.7
+      - /opt/project/src/processing/spark_streaming.py
+
+    restart: unless-stopped
+
+  prometheus:
+    image: confluentinc/cp-enterprise-prometheus:${CONTROL_CENTER_VERSION:-2.6.0}
+    container_name: tfm-prometheus
+    hostname: prometheus
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    volumes:
+      # La imagen de Confluent se inicia con
+      # --config.file=/mnt/config/prometheus-generated.yml.
+      # Mantener aquí versionados la configuración de Prometheus y web-config-prom.yml.
+      - ./docker/control-center/config:/mnt/config
+      - tfm_prometheus_data:/prometheus
+    environment:
+      CONFIG_PATH: /mnt/config
+      SHOULD_LOG_TO_FILE: "false"
+      LOG_FILE: /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9090'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  alertmanager:
+    image: confluentinc/cp-enterprise-alertmanager:${CONTROL_CENTER_VERSION:-2.6.0}
+    container_name: tfm-alertmanager
+    hostname: alertmanager
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    ports:
+      - "${ALERTMANAGER_HOST_PORT:-9093}:9093"
+    volumes:
+      # Incluye alertmanager-generated.yml + web-config-am.yml.
+      - ./docker/control-center/config:/mnt/config
+      - tfm_alertmanager_data:/alertmanager
+    environment:
+      CONFIG_PATH: /mnt/config
+      SHOULD_LOG_TO_FILE: "false"
+      LOG_FILE: /dev/null
+
+  control-center:
+    # Control Center tiene su propio ciclo de versiones respecto de Confluent Platform 8.x.
+    # C3 2.6.x es compatible con Confluent Platform hasta la rama 8.3.x.
+    image: confluentinc/cp-enterprise-control-center-next-gen:${CONTROL_CENTER_VERSION:-2.6.0}
+    container_name: tfm-control-center
+    hostname: control-center
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      prometheus:
+        condition: service_healthy
+      alertmanager:
+        condition: service_started
+    ports:
+      - "${CONTROL_CENTER_HOST_PORT:-9021}:9021"
+    environment:
+      CONTROL_CENTER_BOOTSTRAP_SERVERS: kafka:29092
+      CONTROL_CENTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONTROL_CENTER_REPLICATION_FACTOR: 1
+      CONTROL_CENTER_COMMAND_TOPIC_REPLICATION: 1
+      CONFLUENT_METRICS_TOPIC_REPLICATION: 1
+      CONTROL_CENTER_REST_LISTENERS: http://0.0.0.0:9021
+      CONTROL_CENTER_PROMETHEUS_ENABLE: "true"
+      CONTROL_CENTER_PROMETHEUS_URL: http://prometheus:9090
+      CONTROL_CENTER_PROMETHEUS_RULES_FILE: /mnt/config/trigger_rules-generated.yml
+      CONTROL_CENTER_ALERTMANAGER_URL: http://alertmanager:9093
+      CONTROL_CENTER_ALERTMANAGER_CONFIG_FILE: /mnt/config/alertmanager-generated.yml
+      PORT: 9021
+    volumes:
+      - ./docker/control-center/config:/mnt/config
+      - tfm_control_center_data:/var/lib/confluent-control-center
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:9021/ >/dev/null || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  pipeline:
+    profiles: ['batch']
+    image: tfm-abb-app:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: tfm-pipeline
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-tfm_tightening}
+      POSTGRES_USER: ${POSTGRES_USER:-tfm_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tfm_password}
+      POSTGRES_SCHEMA: analytics
+    volumes:
+      - ./data:/app/data
+    command:
+      [
+        "python",
+        "-m",
+        "pipelines.run_end_to_end",
+        "--bronze-root",
+        "data/bronze",
+        "--silver-root",
+        "data/silver",
+        "--quarantine-root",
+        "data/quarantine",
+        "--gold-root",
+        "data/gold",
+        "--schema-sql",
+        "docker/postgres/init/001_schema.sql",
+      ]
+    restart: "no"
+  producer:
+    profiles: ["producer"]
+    image: tfm-abb-app:latest
+    entrypoint:
+      - python
+      - -m
+      - iot.kafka_producer
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      KAFKA_RAW_TOPIC: ${KAFKA_RAW_TOPIC:-torque-events-raw}
+      KAFKA_SECURITY_PROTOCOL: PLAINTEXT
+
+    volumes:
+      - ./data:/app/data
+
+    restart: "no"
+
+
+volumes:
+  tfm_postgres_data:
+  tfm_kafka_data:
+  tfm_control_center_data:
+  tfm_prometheus_data:
+  tfm_alertmanager_data:
