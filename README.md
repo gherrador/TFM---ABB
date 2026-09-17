@@ -329,7 +329,22 @@ Power BI consume la vista en modo Import. El dashboard privado se encuentra en:
 dashboard/kpi_dashboard.pbix
 ```
 
-El PBIX se incluye solamente en la entrega académica privada porque puede contener información derivada almacenada por el modelo Import. Para una distribución pública debe utilizarse una plantilla `.pbit` sin datos o una versión conectada a fuentes sintéticas.
+### Conexión inicial de Power BI
+
+El archivo de Power BI no almacena las credenciales de PostgreSQL. Por este motivo, la primera vez que se abra o actualice el dashboard, Power BI solicitará autenticación.
+
+Utilizar los valores predeterminados de la infraestructura:
+
+- Servidor: `localhost:5433`
+- Base de datos: `tfm_tightening`
+- Usuario: `tfm_user`
+- Contraseña: `tfm_password`
+
+Si Power BI conserva credenciales anteriores, acceder a:
+
+`Archivo → Opciones y configuración → Configuración de origen de datos`
+
+Seleccionar `localhost:5433;tfm_tightening`, borrar los permisos y volver a actualizar el dashboard.
 
 ## Streaming con Kafka y Spark
 
