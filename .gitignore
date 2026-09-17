@@ -1,6 +1,5 @@
 .env
 .venv/
-.vscode/
 venv/
 __pycache__/
 *.py[cod]
@@ -12,5 +11,4 @@ data/quarantine/
 data/streaming/silver/
 data/streaming/quarantine/
 data/streaming/checkpoints/
-data/bronze/*.csv
-dashboard/*.pbix
+.vscode/
